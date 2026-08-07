@@ -82,3 +82,4 @@ if [ "$INSTALL" -eq 1 ]; then
     rm -rf "/Applications/$APP_NAME.app"
     cp -R "$APP" "/Applications/"
     echo "==> Installed /Applications/$APP_NAME.app"
+fi
