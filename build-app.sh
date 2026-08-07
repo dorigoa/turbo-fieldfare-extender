@@ -1,7 +1,4 @@
 #!/bin/bash
-# Assemble TurboFieldfare.app from the SwiftPM release build.
-# Place this script one directory below the repo root (e.g. scratch/ or Scripts/).
-#
 # Usage:
 #   scratch/make-app.sh [output-directory]      # default: build/
 #   scratch/make-app.sh --install               # also copy to /Applications
@@ -33,13 +30,9 @@ echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# The app resolves its decode service as a sibling of its own executable.
 cp "$RELEASE/TurboFieldfareMac" "$APP/Contents/MacOS/"
 cp "$RELEASE/TurboFieldfareDecodeService" "$APP/Contents/MacOS/"
 
-# SwiftPM's generated Bundle.module accessor looks for resource bundles at
-# Bundle.main.bundleURL, which for an .app is the bundle root itself -- not
-# Contents/Resources. They have to live next to Contents/.
 for bundle in "$RELEASE"/*.bundle; do
     [ -e "$bundle" ] || continue
     cp -R "$bundle" "$APP/"
@@ -80,11 +73,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# No codesign step: the Swift linker already ad-hoc signs both executables, and
-# a bundle-level signature is impossible while the SwiftPM resource bundles sit
-# in the bundle root -- codesign rejects that with "unsealed contents present in
-# the bundle root". A locally built app carries no quarantine flag, so Gatekeeper
-# never asks for one.
 echo "==> Signature: $(codesign -dv "$APP/Contents/MacOS/TurboFieldfareDecodeService" 2>&1 | grep -m1 Signature)"
 
 echo "==> Built $APP"
