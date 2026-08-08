@@ -1,0 +1,13 @@
+{
+  "pins": {
+    "mlx-community/gemma-4-26B-A4B-it-qat-4bit": {
+      "approximateDownloadBytes": 14952958284,
+      "displayName": "Gemma 4 26B-A4B IT QAT 4-bit",
+      "installedBytes": 14559575188,
+      "repoID": "mlx-community/gemma-4-26B-A4B-it-qat-4bit",
+      "revision": "0e3cbab38ce568cf6e23543010d08d03b731910c",
+      "sourceIndexSHA256": "5455e83705bbdd4e3702c7d4f9d49d4900e84533036628f74500538075dd5c80"
+    }
+  },
+  "selected": "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
+}

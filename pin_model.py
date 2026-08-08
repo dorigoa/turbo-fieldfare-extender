@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-"""Re-point TurboFieldfare's pinned model at the Gemma 4 26B-A4B IT **QAT** 4-bit checkpoint.
+"""Re-point TurboFieldfare's pinned model at a different MLX checkpoint.
 
 The upstream project pins exactly one source checkpoint
 (`mlx-community/gemma-4-26b-a4b-it-4bit`) in three places: the installer's
 `SupportedModelSource`, the Mac app's `AppModelInstallDescriptor`, and the test
-that guards those constants. This script rewrites those constants to
-`mlx-community/gemma-4-26B-A4B-it-qat-4bit` so both the CLI installer and the
-in-app download fetch the QAT build instead.
+that guards those constants. This script rewrites those constants so both the
+CLI installer and the in-app download fetch the checkpoint you selected.
 
 Run it again after every `git pull` / fresh clone of the upstream repository.
 
-    python3 Scripts/apply_gemma_qat.py                 # apply pinned QAT values
-    python3 Scripts/apply_gemma_qat.py --check         # report only, change nothing
-    python3 Scripts/apply_gemma_qat.py --refresh       # re-resolve from Hugging Face first
-    python3 Scripts/apply_gemma_qat.py --revision SHA  # pin a specific QAT commit
+    python3 Scripts/pin_model.py                       # re-apply the current selection
+    python3 Scripts/pin_model.py --model ORG/REPO      # switch model, then remember it
+    python3 Scripts/pin_model.py --check               # report only, change nothing
+    python3 Scripts/pin_model.py --refresh             # re-resolve the selection from HF
+    python3 Scripts/pin_model.py --revision SHA        # pin a specific commit
+    python3 Scripts/pin_model.py --list                # show what is pinned
 
-The patch is written against *field names*, not against the old values, so it
-still applies after the maintainer bumps the stock checkpoint. If upstream
-restructures one of the files the script refuses to write anything and tells you
-which pattern stopped matching.
+Switching model needs the network exactly once. `--model` resolves the repo's
+head commit, sizes the install, patches the checkout and records everything in
+`model_pins.json` next to this script, which also becomes the new default
+selection. Later runs with no arguments — including the one in `makeall.sh` —
+replay that pin offline. Commit `model_pins.json` alongside this file.
+
+Compatibility: the runtime hardwires 4-bit kernels for the embedding table, the
+attention projections and the routed experts (`EmbedLookupInt4`,
+`DequantInt4GEMV` in `RealForwardRunner`); only the shared expert switches on a
+manifest field (`Model.sharedExpertWeightBits`, 4 or 8, backed by
+`SharedExpertInt4`/`SharedExpertInt8`). The manifest carries one width per
+category — embedding, attention, router, sharedExpert, routedExpert — so a
+checkpoint that varies width *per layer* cannot be described at all: the
+repacker samples one tensor per category (`RemoteStreamingRepacker.writeManifest`)
+and `Model.requireAffine` then rejects every layer that disagrees. The QAT build
+fits because its only deviation is the shared expert plus router at 8 bits,
+uniformly. Anything else is refused here unless you pass `--force`.
 
 No documentation (`*.md`) is touched — only compiled sources plus the test that
 asserts the pinned values.
-
-Why the QAT build works unchanged: it has the identical architecture and file
-layout, and its only quantization difference is the shared-expert MLP at 8 bits
-instead of 4. The runtime already reads that width from `manifest.json`
-(`Model.sharedExpertWeightBits`), the manifest validator already accepts 4 or 8
-for that slot, and `SharedExpertInt8` already exists. Nothing else to change.
 """
 
 from __future__ import annotations
@@ -40,22 +48,31 @@ import os
 import re
 import struct
 import sys
+import urllib.error
 import urllib.request
 
 # --------------------------------------------------------------------------
-# Pinned QAT source. Regenerate with --refresh.
+# Pin storage. `model_pins.json` is written next to this script; the built-in
+# entry below is the fallback when that file does not exist yet.
 # --------------------------------------------------------------------------
 
-QAT = {
-    "displayName": "Gemma 4 26B-A4B IT QAT 4-bit",
-    "repoID": "mlx-community/gemma-4-26B-A4B-it-qat-4bit",
-    "revision": "0e3cbab38ce568cf6e23543010d08d03b731910c",
-    "sourceIndexSHA256": "5455e83705bbdd4e3702c7d4f9d49d4900e84533036628f74500538075dd5c80",
-    "approximateDownloadBytes": 14_952_958_284,
-    "installedBytes": 14_559_575_188,
-}
+STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_pins.json")
 
-QAT_REPO = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
+DEFAULT_REPO = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
+
+PIN_FIELDS = ("displayName", "repoID", "revision", "sourceIndexSHA256",
+              "approximateDownloadBytes", "installedBytes")
+
+BUILTIN_PINS = {
+    DEFAULT_REPO: {
+        "displayName": "Gemma 4 26B-A4B IT QAT 4-bit",
+        "repoID": DEFAULT_REPO,
+        "revision": "0e3cbab38ce568cf6e23543010d08d03b731910c",
+        "sourceIndexSHA256": "5455e83705bbdd4e3702c7d4f9d49d4900e84533036628f74500538075dd5c80",
+        "approximateDownloadBytes": 14_952_958_284,
+        "installedBytes": 14_559_575_188,
+    },
+}
 
 # `installedBytes` is the size of the *finished* .gturbo directory, not just the
 # planner's output files. Beyond model_weights.bin + packed_experts/*.bin it also
@@ -67,6 +84,7 @@ QAT_REPO = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
 # sidecars); it is layout-shaped, so it carries over to any same-architecture
 # revision.
 JSON_METADATA_BYTES = 8_464_004
+CALIBRATED_SHAPE = (30, 128)  # (num_hidden_layers, num_experts) JSON_METADATA_BYTES was measured on
 
 # Sidecars the repacker copies into <model>.gturbo/tokenizer/.
 SIDECAR_FILES = (
@@ -77,6 +95,64 @@ SIDECAR_FILES = (
     "chat_template.jinja",
     "chat_template.json",
 )
+
+
+def load_store() -> dict:
+    try:
+        with open(STORE_PATH, encoding="utf-8") as handle:
+            store = json.load(handle)
+    except (OSError, ValueError):
+        store = {}
+    store.setdefault("selected", None)
+    store.setdefault("pins", {})
+    return store
+
+
+def save_store(store: dict) -> None:
+    with open(STORE_PATH, "w", encoding="utf-8") as handle:
+        json.dump(store, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def known_pin(store: dict, repo: str) -> dict | None:
+    return store["pins"].get(repo) or BUILTIN_PINS.get(repo)
+
+
+# --------------------------------------------------------------------------
+# Display name derivation. `--display-name` overrides it.
+# --------------------------------------------------------------------------
+
+ACRONYMS = {"it", "qat", "sft", "dpo", "rl", "mlx", "gguf", "awq", "gptq", "moe", "pt"}
+
+
+def is_size_token(token: str) -> bool:
+    """True for spec fragments like 26B or A4B, which read as one unit: 26B-A4B."""
+    return (len(token) >= 2 and token == token.upper()
+            and any(c.isdigit() for c in token) and any(c.isalpha() for c in token))
+
+
+def derive_display_name(repo: str) -> str:
+    """mlx-community/gemma-4-26B-A4B-it-qat-4bit -> Gemma 4 26B-A4B IT QAT 4-bit"""
+    words = []
+    for token in repo.split("/")[-1].split("-"):
+        bits = re.fullmatch(r"(\d+)bit", token.lower())
+        if token.lower() in ACRONYMS:
+            words.append(token.upper())
+        elif bits:
+            words.append(bits.group(1) + "-bit")
+        elif token.islower():
+            words.append(token.capitalize())
+        else:
+            words.append(token)
+
+    merged = words[:1]
+    for word in words[1:]:
+        if is_size_token(word) and is_size_token(merged[-1]):
+            merged[-1] += "-" + word
+        else:
+            merged.append(word)
+    return " ".join(merged)
+
 
 # --------------------------------------------------------------------------
 # Files to patch. Each rule: (regex with one capturing group for the value,
@@ -176,7 +252,7 @@ def rules(values: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Hugging Face sizing (only used by --refresh / --revision)
+# Hugging Face sizing (only used when a pin has to be resolved)
 # --------------------------------------------------------------------------
 
 PAGE = 16384
@@ -184,6 +260,10 @@ RESIDENT_HEADER_BYTES = 24     # GTurboFormatV1.residentHeaderBytes
 RESIDENT_ENTRY_BYTES = 72      # GTurboFormatV1.residentEntryBytes
 RANGE_CHUNK = 64 * 1024 * 1024  # RemoteChunkPolicy.defaultBytes
 MULTIMODAL_PREFIXES = ("vision_tower.", "embed_vision.", "audio_tower.")
+
+# Per-tensor quantization overrides the repack format can already express: the
+# shared-expert MLP and the router, which is how the QAT build differs from stock.
+MIXED_PRECISION_ALLOWED = (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj", ".router.proj")
 
 
 def http_get(url: str, byte_range=None) -> bytes:
@@ -217,7 +297,38 @@ def sidecar_sizes(repo: str, revision: str) -> int:
     return total
 
 
-def compute_source(repo: str, revision: str) -> dict:
+def quantization_problems(config: dict) -> list:
+    """Bit widths this build cannot run. See the compatibility note up top.
+
+    Only the shared-expert MLP and the router may deviate from the checkpoint's
+    global width, and only uniformly across layers — that is the one shape the
+    manifest can describe and the runtime can decode.
+    """
+    quant = config.get("quantization")
+    if not isinstance(quant, dict):
+        return ["config.json has no `quantization` block"]
+    global_bits = quant.get("bits")
+    global_group = quant.get("group_size")
+    if global_bits is None:
+        return ["config.json quantization block has no global `bits`"]
+
+    problems = []
+    for name, entry in sorted(quant.items()):
+        if not isinstance(entry, dict):
+            continue
+        bits = entry.get("bits", global_bits)
+        group = entry.get("group_size", global_group)
+        if group != global_group:
+            problems.append("%s: group_size %s, global is %s" % (name, group, global_group))
+        if bits == global_bits:
+            continue
+        if name.endswith(MIXED_PRECISION_ALLOWED) and bits in (4, 8):
+            continue
+        problems.append("%s: %s-bit, global is %s-bit" % (name, bits, global_bits))
+    return problems
+
+
+def compute_source(repo: str, revision: str, display_name: str, force: bool = False) -> dict:
     """Mirror RepackPlanner + RangeCopyPlanner to size the install for `repo@revision`."""
     base = "https://huggingface.co/%s/resolve/%s/" % (repo, revision)
     index_bytes = http_get(base + "model.safetensors.index.json")
@@ -226,6 +337,27 @@ def compute_source(repo: str, revision: str) -> dict:
     text_config = config["text_config"]
     num_layers = text_config["num_hidden_layers"]
     num_experts = text_config["num_experts"]
+
+    problems = quantization_problems(config)
+    if problems:
+        print("\n  ! %s uses bit widths this build cannot run:" % repo)
+        for problem in problems[:10]:
+            print("      %s" % problem)
+        if len(problems) > 10:
+            print("      ... and %d more" % (len(problems) - 10))
+        print("    Only the shared-expert MLP and the router may deviate from the global")
+        print("    width; embedding, attention and routed experts go through hardwired")
+        print("    4-bit kernels. The repack itself would succeed — expect several GB")
+        print("    downloaded, then `ModelError.indexCorrupt: affine metadata mismatch`")
+        print("    at load, or wrong output where the byte sizes happen to line up.")
+        if not force:
+            raise SystemExit("\nRefusing to pin %s. Re-run with --force to pin it anyway." % repo)
+        print("    --force given: pinning anyway.\n")
+
+    if (num_layers, num_experts) != CALIBRATED_SHAPE:
+        print("  ! %d layers x %d experts; JSON_METADATA_BYTES is calibrated for %d x %d,"
+              " so installedBytes may be off by a few MB"
+              % (num_layers, num_experts, *CALIBRATED_SHAPE))
 
     registry = {}
     for shard in sorted(set(index["weight_map"].values())):
@@ -340,7 +472,7 @@ def compute_source(repo: str, revision: str) -> dict:
     planned = index_size + payload + layer_bytes
     installed = planned + sidecar_sizes(repo, revision) + JSON_METADATA_BYTES
     return {
-        "displayName": QAT["displayName"],
+        "displayName": display_name,
         "repoID": repo,
         "revision": revision,
         "sourceIndexSHA256": hashlib.sha256(index_bytes).hexdigest(),
@@ -427,7 +559,7 @@ def apply(repo_path: str, values: dict, check_only: bool) -> int:
         return 1
 
     if not edits:
-        print("\nAlready pinned to the QAT checkpoint — nothing to do.")
+        print("\nAlready pinned to this checkpoint — nothing to do.")
         return 0
 
     for _, relative, _ in edits:
@@ -447,23 +579,86 @@ def apply(repo_path: str, values: dict, check_only: bool) -> int:
     print("\nThe existing .gturbo install is the old checkpoint — reinstall it:")
     print("    swift run -c release TurboFieldfareRepack \\")
     print("      --output scratch/gemma4.gturbo --overwrite")
-    print("(or use the in-app download, which now points at the QAT repo).")
+    print("(or use the in-app download, which now points at the new repo).")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Selection
+# --------------------------------------------------------------------------
+
+
+def resolve_values(args, store: dict) -> tuple:
+    """-> (values, origin). Hits the network only when there is no usable pin."""
+    repo = args.model or store["selected"] or DEFAULT_REPO
+    pin = known_pin(store, repo)
+    display = (args.display_name
+               or (pin or {}).get("displayName")
+               or derive_display_name(repo))
+
+    if pin and not (args.refresh or args.revision):
+        values = dict(pin)
+        origin = "model_pins.json" if repo in store["pins"] else "built-in default"
+    else:
+        try:
+            revision = args.revision or resolve_revision(repo)
+            print("Resolving %s@%s from Hugging Face ..." % (repo, revision))
+            values = compute_source(repo, revision, display, force=args.force)
+        except urllib.error.HTTPError as error:
+            hint = " (private or gated? export HF_TOKEN)" if error.code in (401, 403) else ""
+            raise SystemExit("error: Hugging Face returned %d %s for %s%s"
+                             % (error.code, error.reason, error.url, hint))
+        except urllib.error.URLError as error:
+            raise SystemExit("error: cannot reach Hugging Face (%s). A cached pin is used "
+                             "offline, but %s has none yet." % (error.reason, repo))
+        origin = "Hugging Face"
+
+    values["displayName"] = display
+    values["repoID"] = repo
+    return values, origin
+
+
+def show_pins(store: dict) -> int:
+    selected = store["selected"] or DEFAULT_REPO
+    repos = sorted(set(store["pins"]) | set(BUILTIN_PINS))
+    print("Pinned models (%s):" % STORE_PATH)
+    for repo in repos:
+        pin = known_pin(store, repo)
+        print(" %s %s@%s" % ("*" if repo == selected else " ", repo, pin["revision"]))
+        print("     %s — %.2f GB installed, %.2f GB downloaded%s"
+              % (pin["displayName"],
+                 pin["installedBytes"] / 1e9,
+                 pin["approximateDownloadBytes"] / 1e9,
+                 "" if repo in store["pins"] else "  (built-in)"))
+    print("\n* = current selection, used when --model is omitted.")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Re-pin TurboFieldfare to the Gemma 4 26B-A4B IT QAT 4-bit checkpoint.")
+        description="Re-pin TurboFieldfare to a different MLX checkpoint.")
     parser.add_argument("--repo-path", default=".",
                         help="path to the turbo-fieldfare checkout (default: current directory)")
+    parser.add_argument("--model", metavar="ORG/REPO",
+                        help="Hugging Face repo to pin. Resolved and sized on first use, then "
+                             "cached in model_pins.json and used as the default selection.")
+    parser.add_argument("--display-name",
+                        help="override the display name (default: derived from the repo id)")
     parser.add_argument("--check", action="store_true",
                         help="report what would change and exit without writing")
     parser.add_argument("--refresh", action="store_true",
-                        help="resolve the QAT repo's current commit on Hugging Face and "
-                             "recompute the pinned hash and byte counts")
+                        help="ignore the cached pin and re-resolve from Hugging Face")
     parser.add_argument("--revision",
-                        help="pin this QAT commit instead (implies --refresh's recomputation)")
+                        help="pin this commit instead of the repo's current head")
+    parser.add_argument("--force", action="store_true",
+                        help="pin even if the checkpoint's quantization layout is unsupported")
+    parser.add_argument("--list", action="store_true",
+                        help="show the pinned models and exit")
     args = parser.parse_args()
+
+    store = load_store()
+    if args.list:
+        return show_pins(store)
 
     repo_path = os.path.abspath(args.repo_path)
     marker = os.path.join(repo_path, "Sources", "TurboFieldfareRepack", "Core", "Remote",
@@ -473,23 +668,23 @@ def main() -> int:
               "(no %s)" % (repo_path, os.path.relpath(marker, repo_path)), file=sys.stderr)
         return 2
 
-    if args.refresh or args.revision:
-        revision = args.revision or resolve_revision(QAT_REPO)
-        print("Resolving %s@%s from Hugging Face ..." % (QAT_REPO, revision[:12]))
-        values = compute_source(QAT_REPO, revision)
-        print("  index sha256              %s" % values["sourceIndexSHA256"])
-        print("  approximateDownloadBytes  %d" % values["approximateDownloadBytes"])
-        print("  installedBytes            %d" % values["installedBytes"])
-        if values != {k: QAT[k] for k in values}:
-            print("\n  (differs from the values pinned in this script — using the fresh ones.")
-            print("   Paste them into QAT at the top of this file to make them the default.)")
-    else:
-        values = dict(QAT)
+    values, origin = resolve_values(args, store)
+
+    print("\nPinning %s@%s  (from %s)" % (values["repoID"], values["revision"], origin))
+    print("  displayName               %s" % values["displayName"])
+    print("  sourceIndexSHA256         %s" % values["sourceIndexSHA256"])
+    print("  approximateDownloadBytes  %d" % values["approximateDownloadBytes"])
+    print("  installedBytes            %d" % values["installedBytes"])
 
     values["requiredFreeBytes"] = required_free_bytes(repo_path, values["installedBytes"])
+    status = apply(repo_path, values, args.check)
 
-    print("\nPinning %s@%s" % (values["repoID"], values["revision"][:12]))
-    return apply(repo_path, values, args.check)
+    if status == 0 and not args.check:
+        store["pins"][values["repoID"]] = {field: values[field] for field in PIN_FIELDS}
+        store["selected"] = values["repoID"]
+        save_store(store)
+
+    return status
 
 
 if __name__ == "__main__":
