@@ -261,6 +261,12 @@ RESIDENT_ENTRY_BYTES = 72      # GTurboFormatV1.residentEntryBytes
 RANGE_CHUNK = 64 * 1024 * 1024  # RemoteChunkPolicy.defaultBytes
 MULTIMODAL_PREFIXES = ("vision_tower.", "embed_vision.", "audio_tower.")
 
+# The width the runtime can actually decode outside the shared expert:
+# EmbedLookupInt4 and DequantInt4GEMV are 4-bit only, and every quant kernel
+# asserts Quantization.groupSize, which is 64.
+RUNTIME_BASE_BITS = 4
+RUNTIME_GROUP_SIZE = 64
+
 # Per-tensor quantization overrides the repack format can already express: the
 # shared-expert MLP and the router, which is how the QAT build differs from stock.
 MIXED_PRECISION_ALLOWED = (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj", ".router.proj")
@@ -300,9 +306,12 @@ def sidecar_sizes(repo: str, revision: str) -> int:
 def quantization_problems(config: dict) -> list:
     """Bit widths this build cannot run. See the compatibility note up top.
 
-    Only the shared-expert MLP and the router may deviate from the checkpoint's
-    global width, and only uniformly across layers — that is the one shape the
-    manifest can describe and the runtime can decode.
+    Two things have to hold. The checkpoint's global width must be 4, because
+    embedding, attention and routed experts go through 4-bit-only kernels, and
+    `Model.affineSizes` accepts nothing but 4 or 8 per slot anyway. And the only
+    tensors allowed to deviate from it are the shared-expert MLP and the router,
+    uniformly across layers — that is the one shape the manifest can describe
+    and the runtime can decode.
     """
     quant = config.get("quantization")
     if not isinstance(quant, dict):
@@ -313,6 +322,15 @@ def quantization_problems(config: dict) -> list:
         return ["config.json quantization block has no global `bits`"]
 
     problems = []
+    if global_bits != RUNTIME_BASE_BITS:
+        problems.append(
+            "global `bits` is %s: embedding, attention and routed experts go through "
+            "%d-bit-only kernels" % (global_bits, RUNTIME_BASE_BITS))
+    if global_group != RUNTIME_GROUP_SIZE:
+        problems.append(
+            "global `group_size` is %s: every quant kernel asserts Quantization.groupSize (%d)"
+            % (global_group, RUNTIME_GROUP_SIZE))
+
     for name, entry in sorted(quant.items()):
         if not isinstance(entry, dict):
             continue
@@ -345,11 +363,12 @@ def compute_source(repo: str, revision: str, display_name: str, force: bool = Fa
             print("      %s" % problem)
         if len(problems) > 10:
             print("      ... and %d more" % (len(problems) - 10))
-        print("    Only the shared-expert MLP and the router may deviate from the global")
-        print("    width; embedding, attention and routed experts go through hardwired")
-        print("    4-bit kernels. The repack itself would succeed — expect several GB")
-        print("    downloaded, then `ModelError.indexCorrupt: affine metadata mismatch`")
-        print("    at load, or wrong output where the byte sizes happen to line up.")
+        print("    This build runs a %d-bit checkpoint whose shared-expert MLP and router"
+              % RUNTIME_BASE_BITS)
+        print("    may be 8-bit, and nothing else. The repack itself would succeed —")
+        print("    expect several GB downloaded, then ModelError.indexCorrupt at load")
+        print("    (unsupported affine quantization, or an affine metadata mismatch),")
+        print("    or wrong output wherever the byte sizes happen to line up.")
         if not force:
             raise SystemExit("\nRefusing to pin %s. Re-run with --force to pin it anyway." % repo)
         print("    --force given: pinning anyway.\n")
