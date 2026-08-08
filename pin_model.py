@@ -315,6 +315,12 @@ def quantization_problems(config: dict) -> list:
     """
     quant = config.get("quantization")
     if not isinstance(quant, dict):
+        foreign = config.get("quantization_config")
+        method = foreign.get("quant_method") if isinstance(foreign, dict) else None
+        if method:
+            return ["config.json carries a `%s` quantization_config instead of an MLX "
+                    "`quantization` block; only MLX affine checkpoints can be repacked"
+                    % method]
         return ["config.json has no `quantization` block"]
     global_bits = quant.get("bits")
     global_group = quant.get("group_size")
@@ -349,7 +355,17 @@ def quantization_problems(config: dict) -> list:
 def compute_source(repo: str, revision: str, display_name: str, force: bool = False) -> dict:
     """Mirror RepackPlanner + RangeCopyPlanner to size the install for `repo@revision`."""
     base = "https://huggingface.co/%s/resolve/%s/" % (repo, revision)
-    index_bytes = http_get(base + "model.safetensors.index.json")
+    try:
+        index_bytes = http_get(base + "model.safetensors.index.json")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        raise SystemExit(
+            "error: %s has no model.safetensors.index.json.\n"
+            "  IndexLoader reads that file unconditionally, so the repacker only accepts\n"
+            "  sharded MLX checkpoints. A single-file model.safetensors — common for\n"
+            "  GGUF, compressed-tensors/NVFP4 and AWQ builds — cannot be repacked."
+            % repo)
     index = json.loads(index_bytes)
     config = json.loads(http_get(base + "config.json"))
     text_config = config["text_config"]
